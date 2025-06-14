@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  flux-tracker:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - flux_data:/data
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  flux_data:
