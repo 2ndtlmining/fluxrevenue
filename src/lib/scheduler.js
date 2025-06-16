@@ -7,7 +7,7 @@ import { statements } from './db.js';
 import { 
   getCurrentBlockHeight, 
   getBlockDataBatch, 
-  analyzeBlocksBatch, // FIXED: Now properly exported from flux-api.js
+  analyzeBlocksBatch,
   batchResolveFromAddresses,
   getPerformanceStats,
   resetPerformanceStats,
@@ -36,7 +36,7 @@ const {
 let isRunning = false;
 let syncInterval = null;
 
-// Performance tracking - NEW
+// Performance tracking
 let syncMetrics = {
   totalBlocksProcessed: 0,
   totalSyncTime: 0,
@@ -45,39 +45,118 @@ let syncMetrics = {
   syncCount: 0
 };
 
-// Function to update sync status (uses shared store)
+// Function to update sync status
 function updateSyncStatus(updates) {
   updateSyncInfo(updates);
+}
+
+// NEW: Missing block detection and filling for completion
+async function detectAndFillMissingBlocks(startHeight, endHeight) {
+  console.log(`🔍 Scanning for missing blocks between ${startHeight.toLocaleString()} and ${endHeight.toLocaleString()}`);
+  
+  const existingBlocks = statements.db.prepare(`
+    SELECT height FROM blocks 
+    WHERE height >= ? AND height <= ? 
+    ORDER BY height
+  `).all(startHeight, endHeight);
+  
+  const existingSet = new Set(existingBlocks.map(b => b.height));
+  const missingBlocks = [];
+  
+  for (let height = startHeight; height <= endHeight; height++) {
+    if (!existingSet.has(height)) {
+      missingBlocks.push(height);
+    }
+  }
+  
+  if (missingBlocks.length === 0) {
+    console.log(`✅ No missing blocks found in range`);
+    return 0;
+  }
+  
+  console.log(`🎯 Found ${missingBlocks.length} missing blocks - filling gaps...`);
+  
+  let processed = 0;
+  const batchSize = 50;
+  
+  for (let i = 0; i < missingBlocks.length; i += batchSize) {
+    const batch = missingBlocks.slice(i, i + batchSize);
+    
+    try {
+      const blockResults = await getBlockDataBatch(batch);
+      const analysis = analyzeBlocksBatch(blockResults, getAllTargetAddresses());
+      
+      if (analysis.transactions.length > 0) {
+        const enhancedTransactions = await batchResolveFromAddresses(analysis.transactions, 5);
+        await batchInsertData(blockResults, enhancedTransactions);
+      } else {
+        await batchInsertBlocks(blockResults);
+      }
+      
+      processed += batch.length;
+      console.log(`   ✅ Filled ${processed}/${missingBlocks.length} missing blocks`);
+      
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+    } catch (error) {
+      console.error(`❌ Error processing missing block batch:`, error);
+    }
+  }
+  
+  return processed;
+}
+
+// NEW: Final completion check
+async function performFinalCompletionCheck(currentHeight) {
+  console.log(`🏁 Performing final completion check...`);
+  
+  const syncStatus = getSyncStatus(currentHeight);
+  if (!syncStatus) return false;
+  
+  if (syncStatus.syncProgress >= 95) {
+    console.log(`🎯 Near completion (${syncStatus.syncProgress.toFixed(1)}%) - checking for gaps`);
+    
+    const recentStart = currentHeight - (3 * BLOCKS_PER_DAY);
+    const recentMissing = await detectAndFillMissingBlocks(recentStart, currentHeight);
+    
+    let historicalMissing = 0;
+    if (syncStatus.lowestSynced) {
+      const historicalEnd = syncStatus.lowestSynced;
+      const historicalStart = Math.max(historicalEnd - (7 * BLOCKS_PER_DAY), syncStatus.targetLowestBlock);
+      historicalMissing = await detectAndFillMissingBlocks(historicalStart, historicalEnd);
+    }
+    
+    const totalMissing = recentMissing + historicalMissing;
+    
+    if (totalMissing === 0) {
+      console.log(`🎉🎉🎉 SYNC 100% COMPLETE! 🎉🎉🎉`);
+      return true;
+    } else if (totalMissing < 100) {
+      console.log(`✅ Nearly complete! Filled ${totalMissing} missing blocks.`);
+      return totalMissing === 0;
+    } else {
+      console.log(`📊 Still syncing: ${totalMissing} blocks remaining`);
+      return false;
+    }
+  }
+  
+  return false;
 }
 
 export async function startScheduler() {
   const targetAddresses = getAllTargetAddresses();
   
   console.log('🚀 Starting OPTIMIZED Flux tracker scheduler...');
-  console.log(`📊 Configuration:`);
-  console.log(`   - Target addresses: ${targetAddresses.join(', ')}`);
-  console.log(`   - Total addresses: ${targetAddresses.length}`);
-  console.log(`   - Blocks per day: ${BLOCKS_PER_DAY}`);
-  console.log(`   - Retention days: ${RETENTION_DAYS}`);
-  console.log(`   - Max blocks per sync: ${MAX_BLOCKS_PER_SYNC}`);
-  console.log(`   - Sync interval: ${SYNC_INTERVAL / 1000}s`);
-  console.log(`   - Fast sync enabled: ${ENABLE_FAST_SYNC}`);
-  console.log(`   - Parallel batches: ${PARALLEL_BATCHES}`);
-  console.log(`   - Batch size: ${BATCH_SIZE}`);
-  console.log(`   - Max concurrent API calls: ${API_CONFIG.MAX_CONCURRENT}`);
+  console.log(`📊 Configuration: ${targetAddresses.length} addresses, ${MAX_BLOCKS_PER_SYNC} blocks/sync, ${PARALLEL_BATCHES} batches, ${API_CONFIG.MAX_CONCURRENT} concurrent`);
   
-  // Wait for database to be ready
   await new Promise(resolve => setTimeout(resolve, 3000));
   
-  // Reset performance stats
   if (PERFORMANCE_CONFIG.ENABLE_METRICS) {
     resetPerformanceStats();
   }
   
-  // Do initial sync immediately
   await performSync();
   
-  // Then set up regular interval
   if (syncInterval) clearInterval(syncInterval);
   syncInterval = setInterval(async () => {
     await performSync();
@@ -95,7 +174,6 @@ export async function performSync() {
   isRunning = true;
   const syncStartTime = Date.now();
   
-  // Report sync start
   updateSyncStatus({
     isRunning: true,
     lastSyncTime: Date.now(),
@@ -112,7 +190,6 @@ export async function performSync() {
     
     console.log(`📡 Current network block height: ${currentHeight.toLocaleString()}`);
     
-    // Get sync status with error handling
     const syncStatus = getSyncStatus(currentHeight);
     if (!syncStatus) {
       throw new Error('Could not get sync status - database not ready');
@@ -120,15 +197,28 @@ export async function performSync() {
     
     logSyncStatus(syncStatus);
     
-    // Determine what to sync
     const syncPlan = createSyncPlan(syncStatus, currentHeight);
     logSyncPlan(syncPlan, syncStatus);
     
     if (syncPlan.blocksToSync <= 0) {
       console.log('✅ No blocks to sync - all caught up!');
+      
+      // NEW: Check for final completion when no blocks to sync
+      const isComplete = await performFinalCompletionCheck(currentHeight);
+      if (isComplete) {
+        console.log(`🎉 SYNC FULLY COMPLETE! 🎉`);
+        updateSyncStatus({
+          isRunning: false,
+          lastSyncTime: Date.now(),
+          lastSyncMessage: 'Sync 100% complete - all blocks synchronized',
+          syncRate: 0,
+          isComplete: true
+        });
+        return { success: true, message: 'Sync 100% complete', blocksProcessed: 0, isComplete: true };
+      }
+      
       logSyncSummary(syncStatus);
       
-      // Report completion
       updateSyncStatus({
         isRunning: false,
         lastSyncTime: Date.now(),
@@ -139,7 +229,6 @@ export async function performSync() {
       return { success: true, message: 'No new blocks to sync', blocksProcessed: 0 };
     }
     
-    // Report sync plan
     const planMessage = syncPlan.isHybrid 
       ? `Hybrid sync: ${syncPlan.blocksToSync} forward + ${syncPlan.backwardPlan.blocksToSync} backward blocks`
       : `${syncPlan.direction} sync: ${syncPlan.blocksToSync} blocks`;
@@ -148,24 +237,35 @@ export async function performSync() {
       lastSyncMessage: planMessage
     });
     
-    // Execute optimized sync
     const result = await executeOptimizedSyncPlan(syncPlan, syncStatus);
     
-    // Clean old data
+    // NEW: Final completion check after main sync (when near completion)
+    if (syncStatus.syncProgress >= 95) {
+      const isComplete = await performFinalCompletionCheck(currentHeight);
+      if (isComplete) {
+        console.log(`🎉 SYNC FULLY COMPLETE! 🎉`);
+        updateSyncStatus({
+          isRunning: false,
+          lastSyncTime: Date.now(),
+          lastSyncMessage: 'Sync 100% complete - no missing blocks found!',
+          syncRate: 0,
+          isComplete: true
+        });
+        return { success: true, message: 'Sync 100% complete!', blocksProcessed: result.blocksProcessed, isComplete: true };
+      }
+    }
+    
     await cleanOldData();
     
-    // Update performance metrics
     const syncEndTime = Date.now();
     const syncDuration = (syncEndTime - syncStartTime) / 1000;
     updateSyncMetrics(result.blocksProcessed, syncDuration);
     
-    // Log final status
     const updatedStatus = getSyncStatus(currentHeight);
     if (updatedStatus) {
       logSyncSummary(updatedStatus, result);
     }
     
-    // Log performance stats if enabled
     if (PERFORMANCE_CONFIG.ENABLE_METRICS) {
       logPerformanceStats();
     }
@@ -173,7 +273,6 @@ export async function performSync() {
     console.log(`✅ Optimized sync completed: ${result.message}`);
     console.log('🔄 === SYNC CYCLE COMPLETE ===\n');
     
-    // Report successful completion
     updateSyncStatus({
       isRunning: false,
       lastSyncTime: Date.now(),
@@ -187,7 +286,6 @@ export async function performSync() {
     console.error('❌ Sync failed:', error);
     console.log('🔄 === SYNC CYCLE FAILED ===\n');
     
-    // Report error
     updateSyncStatus({
       isRunning: false,
       lastSyncTime: Date.now(),
@@ -203,7 +301,6 @@ export async function performSync() {
 
 function getSyncStatus(currentHeight) {
   try {
-    // Check if statements are available
     if (!statements || !statements.getTotalBlockCount || !statements.getHighestBlock || !statements.getLowestBlock) {
       console.error('❌ Database statements not initialized');
       return null;
@@ -218,9 +315,8 @@ function getSyncStatus(currentHeight) {
     const lowestSynced = lowestBlockRow?.height || null;
     
     const targetLowestBlock = currentHeight - (BLOCKS_PER_DAY * RETENTION_DAYS);
-    const initialSyncTarget = currentHeight - BLOCKS_PER_DAY; // Last 24 hours
+    const initialSyncTarget = currentHeight - BLOCKS_PER_DAY;
     
-    // Calculate remaining blocks
     const newBlocksRemaining = highestSynced ? Math.max(0, currentHeight - highestSynced) : BLOCKS_PER_DAY;
     const historicalBlocksRemaining = lowestSynced ? Math.max(0, lowestSynced - targetLowestBlock) : (BLOCKS_PER_DAY * RETENTION_DAYS) - BLOCKS_PER_DAY;
     const totalBlocksRemaining = newBlocksRemaining + historicalBlocksRemaining;
@@ -247,7 +343,6 @@ function getSyncStatus(currentHeight) {
   }
 }
 
-// Export this function for use by API
 export { getSyncStatus };
 
 function logSyncStatus(status) {
@@ -264,23 +359,43 @@ function logSyncStatus(status) {
   console.log(`   ↙️  Historical blocks: ${status.historicalBlocksRemaining.toLocaleString()}`);
   console.log(`📊 Sync progress: ${status.syncProgress.toFixed(2)}% of target data`);
   
-  if (status.isFirstRun) {
-    console.log(`🆕 First run detected - will sync initial 24 hours`);
-  }
-  if (status.needsForwardSync) {
-    console.log(`⬆️  Forward sync needed (new blocks available)`);
-  }
-  if (status.needsBackwardSync) {
-    console.log(`⬇️  Backward sync needed (historical data missing)`);
-  }
-  if (!status.hasCompletedInitialSync) {
-    console.log(`🔄 Still completing initial 24-hour sync`);
-  }
+  if (status.isFirstRun) console.log(`🆕 First run detected - will sync initial 24 hours`);
+  if (status.needsForwardSync) console.log(`⬆️  Forward sync needed (new blocks available)`);
+  if (status.needsBackwardSync) console.log(`⬇️  Backward sync needed (historical data missing)`);
+  if (!status.hasCompletedInitialSync) console.log(`🔄 Still completing initial 24-hour sync`);
 }
 
 function createSyncPlan(status, currentHeight) {
+  // NEW: Special handling for near-completion (95%+)
+  if (status.syncProgress >= 95) {
+    console.log(`🎯 Near completion (${status.syncProgress.toFixed(1)}%) - using completion strategy`);
+    
+    if (status.needsForwardSync) {
+      const forwardBlocks = Math.min(status.newBlocksRemaining, 500);
+      return {
+        startBlock: status.highestSynced + 1,
+        endBlock: status.highestSynced + forwardBlocks,
+        blocksToSync: forwardBlocks,
+        direction: 'forward',
+        priority: 'completion_forward',
+        useGapDetection: true
+      };
+    }
+    
+    if (status.needsBackwardSync) {
+      const backwardBlocks = Math.min(status.historicalBlocksRemaining, 1000);
+      return {
+        startBlock: Math.max(status.lowestSynced - backwardBlocks, status.targetLowestBlock),
+        endBlock: status.lowestSynced - 1,
+        blocksToSync: backwardBlocks,
+        direction: 'backward',
+        priority: 'completion_backward',
+        useGapDetection: true
+      };
+    }
+  }
+
   if (status.isFirstRun) {
-    // First run: sync last 24 hours
     const startBlock = Math.max(status.initialSyncTarget, 1);
     const endBlock = currentHeight;
     const totalBlocks = Math.abs(endBlock - startBlock) + 1;
@@ -300,7 +415,6 @@ function createSyncPlan(status, currentHeight) {
   let forwardPlan = null;
   let backwardPlan = null;
   
-  // 1. Calculate forward sync needs (always priority)
   if (status.needsForwardSync) {
     const forwardBlocks = status.newBlocksRemaining;
     const forwardBlocksToSync = Math.min(forwardBlocks, MAX_BLOCKS_PER_SYNC);
@@ -314,23 +428,19 @@ function createSyncPlan(status, currentHeight) {
     };
   }
   
-  // 2. Calculate remaining capacity for backward sync
   const forwardBlocksUsed = forwardPlan ? forwardPlan.blocksToSync : 0;
   const remainingCapacity = MAX_BLOCKS_PER_SYNC - forwardBlocksUsed;
   
-  // 3. Use remaining capacity for historical sync
   if (remainingCapacity > 0 && status.needsBackwardSync) {
     let backwardStartBlock, backwardEndBlock;
     
     if (!status.hasCompletedInitialSync) {
-      // Still working on initial 24 hours backwards
       backwardEndBlock = status.lowestSynced - 1;
       backwardStartBlock = Math.max(
         backwardEndBlock - remainingCapacity + 1, 
         Math.max(status.initialSyncTarget, status.targetLowestBlock)
       );
     } else {
-      // Historical data - progressive backward sync
       backwardEndBlock = status.lowestSynced - 1;
       backwardStartBlock = Math.max(
         backwardEndBlock - remainingCapacity + 1, 
@@ -351,9 +461,7 @@ function createSyncPlan(status, currentHeight) {
     }
   }
   
-  // 4. Return the appropriate plan
   if (forwardPlan && backwardPlan) {
-    // Hybrid sync: both forward and backward
     return {
       ...forwardPlan,
       backwardPlan,
@@ -361,13 +469,10 @@ function createSyncPlan(status, currentHeight) {
       totalCapacityUsed: forwardPlan.blocksToSync + backwardPlan.blocksToSync
     };
   } else if (forwardPlan) {
-    // Only forward sync needed
     return forwardPlan;
   } else if (backwardPlan) {
-    // Only backward sync needed
     return backwardPlan;
   } else {
-    // Nothing to sync
     return { blocksToSync: 0 };
   }
 }
@@ -418,10 +523,8 @@ function logSyncPlan(plan, status) {
   }
 }
 
-// OPTIMIZED: New parallel sync execution
 async function executeOptimizedSyncPlan(plan, status) {
   if (plan.isHybrid) {
-    // Execute hybrid sync: both forward and backward
     console.log(`\n🔨 === EXECUTING OPTIMIZED HYBRID SYNC ===`);
     console.log(`🚀 Running forward + backward sync with parallel processing...`);
     
@@ -429,7 +532,6 @@ async function executeOptimizedSyncPlan(plan, status) {
     let totalPaymentsFound = 0;
     const startTime = Date.now();
     
-    // Execute forward sync first
     console.log(`⬆️  Phase 1: Optimized forward sync (${plan.blocksToSync} blocks)`);
     const forwardResult = await executeOptimizedSyncDirection(
       plan.startBlock, 
@@ -440,7 +542,6 @@ async function executeOptimizedSyncPlan(plan, status) {
     totalProcessed += forwardResult.processed;
     totalPaymentsFound += forwardResult.paymentsFound;
     
-    // Execute backward sync
     console.log(`⬇️  Phase 2: Optimized backward sync (${plan.backwardPlan.blocksToSync} blocks)`);
     const backwardResult = await executeOptimizedSyncDirection(
       plan.backwardPlan.startBlock, 
@@ -473,7 +574,6 @@ async function executeOptimizedSyncPlan(plan, status) {
       backwardBlocks: backwardResult.processed
     };
   } else {
-    // Execute single direction sync
     const { startBlock, endBlock, direction, priority, blocksToSync } = plan;
     
     console.log(`\n🔨 === EXECUTING OPTIMIZED SYNC ===`);
@@ -500,13 +600,11 @@ async function executeOptimizedSyncPlan(plan, status) {
   }
 }
 
-// OPTIMIZED: New parallel block processing function
 async function executeOptimizedSyncDirection(startBlock, endBlock, direction, blocksToSync) {
   let processed = 0;
   let paymentsFound = 0;
   const startTime = Date.now();
   
-  // Generate block height array
   const blockHeights = [];
   if (direction === 'forward') {
     for (let height = startBlock; height <= endBlock; height++) {
@@ -520,7 +618,6 @@ async function executeOptimizedSyncDirection(startBlock, endBlock, direction, bl
 
   console.log(`🚀 Processing ${blockHeights.length} blocks in parallel batches...`);
 
-  // Process in parallel batches
   const actualBatchSize = ENABLE_FAST_SYNC ? BATCH_SIZE : Math.min(BATCH_SIZE, 10);
   
   for (let i = 0; i < blockHeights.length; i += actualBatchSize) {
@@ -530,27 +627,20 @@ async function executeOptimizedSyncDirection(startBlock, endBlock, direction, bl
     console.log(`   📦 Processing batch ${Math.floor(i / actualBatchSize) + 1}/${Math.ceil(blockHeights.length / actualBatchSize)}: blocks ${batchHeights[0]} to ${batchHeights[batchHeights.length - 1]}`);
     
     try {
-      // OPTIMIZED: Fetch all blocks in parallel
       const blockResults = await getBlockDataBatch(batchHeights);
-      
-      // OPTIMIZED: Analyze all blocks at once
       const analysis = analyzeBlocksBatch(blockResults, getAllTargetAddresses());
       
       if (analysis.transactions.length > 0) {
         console.log(`💰 Found ${analysis.transactions.length} payments in batch of ${batchHeights.length} blocks`);
         
-        // OPTIMIZED: Resolve from addresses in parallel
         const enhancedTransactions = await batchResolveFromAddresses(
           analysis.transactions, 
           Math.min(API_CONFIG.MAX_CONCURRENT, 15)
         );
         
-        // OPTIMIZED: Batch insert transactions and blocks
         await batchInsertData(blockResults, enhancedTransactions);
-        
         paymentsFound += enhancedTransactions.length;
       } else {
-        // Even if no payments, still need to record the blocks
         await batchInsertBlocks(blockResults);
       }
       
@@ -561,11 +651,9 @@ async function executeOptimizedSyncDirection(startBlock, endBlock, direction, bl
       const overallElapsed = (Date.now() - startTime) / 1000;
       const overallRate = processed / overallElapsed;
       
-      // Progress logging
       if (processed % (actualBatchSize * 2) === 0 || i + actualBatchSize >= blockHeights.length) {
         console.log(`     📊 Progress: ${processed}/${blocksToSync} blocks (batch: ${batchRate.toFixed(1)} b/s, overall: ${overallRate.toFixed(1)} b/s, ${paymentsFound} payments)`);
         
-        // Report progress
         updateSyncStatus({
           lastSyncMessage: `${direction} sync: ${processed}/${blocksToSync} blocks (${overallRate.toFixed(1)} blocks/sec)`,
           syncRate: overallRate
@@ -574,11 +662,9 @@ async function executeOptimizedSyncDirection(startBlock, endBlock, direction, bl
       
     } catch (error) {
       console.error(`❌ Error processing batch ${i / actualBatchSize + 1}:`, error);
-      // Continue with next batch rather than failing entirely
-      processed += batchHeights.length; // Count as processed to avoid infinite loops
+      processed += batchHeights.length;
     }
     
-    // Small delay between batches if not in fast sync mode
     if (!ENABLE_FAST_SYNC && i + actualBatchSize < blockHeights.length) {
       await new Promise(resolve => setTimeout(resolve, API_CONFIG.REQUEST_DELAY));
     }
@@ -590,10 +676,8 @@ async function executeOptimizedSyncDirection(startBlock, endBlock, direction, bl
   return { processed, paymentsFound, elapsed, rate };
 }
 
-// OPTIMIZED: Batch insert blocks and transactions
 async function batchInsertData(blockResults, transactions) {
   try {
-    // Prepare block inserts
     const blockInserts = blockResults
       .filter(result => result.data)
       .map(result => [
@@ -602,7 +686,6 @@ async function batchInsertData(blockResults, transactions) {
         result.data.hash || ''
       ]);
 
-    // Batch insert blocks
     if (blockInserts.length > 0) {
       const blockInsertTransaction = statements.db.transaction(() => {
         for (const insert of blockInserts) {
@@ -612,7 +695,6 @@ async function batchInsertData(blockResults, transactions) {
       blockInsertTransaction();
     }
 
-    // Batch insert transactions
     if (transactions && transactions.length > 0) {
       const transactionInserts = transactions.map(tx => {
         const blockData = blockResults.find(b => b.height === tx.blockHeight);
@@ -634,7 +716,6 @@ async function batchInsertData(blockResults, transactions) {
           try {
             statements.insertTransaction.run(...insert);
           } catch (dbError) {
-            // Transaction might already exist, which is fine due to UNIQUE constraint
             if (!dbError.message.includes('UNIQUE constraint failed')) {
               console.error('❌ Error storing transaction:', dbError);
             }
@@ -646,12 +727,10 @@ async function batchInsertData(blockResults, transactions) {
 
   } catch (error) {
     console.error('❌ Error in batch insert:', error);
-    // Fallback to individual inserts
     await fallbackIndividualInserts(blockResults, transactions);
   }
 }
 
-// OPTIMIZED: Batch insert blocks only (when no transactions found)
 async function batchInsertBlocks(blockResults) {
   try {
     const blockInserts = blockResults
@@ -672,7 +751,6 @@ async function batchInsertBlocks(blockResults) {
     }
   } catch (error) {
     console.error('❌ Error in batch block insert:', error);
-    // Fallback to individual inserts
     for (const result of blockResults) {
       if (result.data) {
         try {
@@ -689,11 +767,9 @@ async function batchInsertBlocks(blockResults) {
   }
 }
 
-// Fallback function for individual inserts when batch fails
 async function fallbackIndividualInserts(blockResults, transactions) {
   console.log('⚠️ Using fallback individual inserts...');
   
-  // Insert blocks individually
   for (const result of blockResults) {
     if (result.data) {
       try {
@@ -708,7 +784,6 @@ async function fallbackIndividualInserts(blockResults, transactions) {
     }
   }
 
-  // Insert transactions individually
   if (transactions && transactions.length > 0) {
     for (const tx of transactions) {
       const blockData = blockResults.find(b => b.height === tx.blockHeight);
@@ -733,85 +808,6 @@ async function fallbackIndividualInserts(blockResults, transactions) {
   }
 }
 
-// Legacy individual block processing (kept for backward compatibility)
-async function processBlock(blockHeight) {
-  try {
-    const blockResults = await getBlockDataBatch([blockHeight]);
-    const blockData = blockResults[0]?.data;
-    
-    if (!blockData) return 0;
-    
-    // Insert block record
-    statements.insertBlock.run(
-      blockHeight,
-      blockData.time || Math.floor(Date.now() / 1000),
-      blockData.hash || ''
-    );
-    
-    // Use the enhanced block analysis function for multiple addresses
-    const targetAddresses = getAllTargetAddresses();
-    const analysis = analyzeBlocksBatch([blockResults[0]], targetAddresses);
-    
-    if (analysis.transactions.length === 0) {
-      return 0;
-    }
-    
-    console.log(`💰 Found ${analysis.transactions.length} payments in block ${blockHeight} across ${targetAddresses.length} addresses`);
-    
-    // Log address breakdown if multiple addresses
-    if (targetAddresses.length > 1) {
-      for (const [address, breakdown] of Object.entries(analysis.addressBreakdown)) {
-        if (breakdown.count > 0) {
-          console.log(`   📍 ${address}: ${breakdown.count} payments (${breakdown.value.toFixed(8)} FLUX)`);
-        }
-      }
-    }
-    
-    // Resolve any from addresses that need lookup
-    const enhancedTransactions = await batchResolveFromAddresses(analysis.transactions, 3);
-    
-    let paymentsStored = 0;
-    
-    // Store each transaction with from_address
-    for (const tx of enhancedTransactions) {
-      try {
-        // Clean up the from address
-        let fromAddress = tx.from;
-        if (fromAddress === 'Unknown' || !fromAddress) {
-          fromAddress = null;
-        }
-        
-        statements.insertTransaction.run(
-          blockHeight,           // block_height
-          tx.id || '',          // tx_hash
-          tx.voutIndex || 0,    // vout_index
-          tx.to,                // address (recipient) - now uses the actual target address
-          fromAddress,          // from_address (sender)
-          tx.amount || 0,       // value
-          blockData.time || Math.floor(Date.now() / 1000) // timestamp
-        );
-        
-        paymentsStored++;
-        
-        // Log payment details
-        console.log(`💰 Stored payment: ${tx.amount.toFixed(8)} FLUX from ${fromAddress || 'Unknown'} to ${tx.to} (${tx.id})`);
-        
-      } catch (dbError) {
-        // Transaction might already exist, which is fine due to UNIQUE constraint
-        if (!dbError.message.includes('UNIQUE constraint failed')) {
-          console.error('❌ Error storing transaction:', dbError);
-        }
-      }
-    }
-    
-    return paymentsStored;
-    
-  } catch (error) {
-    console.error(`❌ Error processing block ${blockHeight}:`, error);
-    return 0;
-  }
-}
-
 function logSyncSummary(status, result = null) {
   const targetAddresses = getAllTargetAddresses();
   
@@ -821,7 +817,6 @@ function logSyncSummary(status, result = null) {
   console.log(`⏳ Total blocks remaining: ${status.totalBlocksRemaining.toLocaleString()}`);
   console.log(`📊 Progress: ${status.syncProgress.toFixed(2)}% of target (${RETENTION_DAYS} days)`);
   
-  // Performance summary
   if (PERFORMANCE_CONFIG.ENABLE_METRICS && syncMetrics.syncCount > 0) {
     console.log(`⚡ Performance metrics:`);
     console.log(`   📈 Average sync speed: ${syncMetrics.averageBlocksPerSecond.toFixed(1)} blocks/sec`);
@@ -829,24 +824,18 @@ function logSyncSummary(status, result = null) {
     console.log(`   🏆 Total blocks processed: ${syncMetrics.totalBlocksProcessed.toLocaleString()}`);
   }
   
-  // Add database size info with proper ES module imports
   try {
     const dbPath = 'flux-tracker.db';
     if (existsSync(dbPath)) {
       const stats = readFileSync(dbPath);
-      const fileSizeInBytes = stats.length;
-      const fileSizeInMB = (fileSizeInBytes / (1024 * 1024)).toFixed(2);
-      const fileSizeInKB = (fileSizeInBytes / 1024).toFixed(1);
-      console.log(`💾 Database size: ${fileSizeInMB} MB (${fileSizeInKB} KB, ${fileSizeInBytes.toLocaleString()} bytes)`);
-    } else {
-      console.log(`💾 Database file not found at: ${dbPath}`);
+      const fileSizeInMB = (stats.length / (1024 * 1024)).toFixed(2);
+      console.log(`💾 Database size: ${fileSizeInMB} MB`);
     }
   } catch (error) {
     console.log(`💾 Database size: Error reading file - ${error.message}`);
   }
   
   if (status.totalBlocksRemaining > 0) {
-    // Updated ETA calculation based on current performance
     const currentRate = syncMetrics.averageBlocksPerSecond || (result?.blocksPerSecond) || 10;
     const estimatedMinutes = status.totalBlocksRemaining / currentRate / 60;
     const estimatedHours = estimatedMinutes / 60;
@@ -891,7 +880,6 @@ async function cleanOldData() {
   }
 }
 
-// Performance tracking functions - NEW
 function updateSyncMetrics(blocksProcessed, syncDuration) {
   syncMetrics.totalBlocksProcessed += blocksProcessed;
   syncMetrics.totalSyncTime += syncDuration;
@@ -920,7 +908,6 @@ function logPerformanceStats() {
   }
 }
 
-// Get performance metrics for API
 export function getSyncMetrics() {
   return {
     ...syncMetrics,
@@ -928,12 +915,10 @@ export function getSyncMetrics() {
   };
 }
 
-// Utility function to backfill from addresses for existing transactions - OPTIMIZED
 export async function backfillFromAddresses(limit = 100) {
   try {
     console.log(`🔍 Starting OPTIMIZED backfill of from addresses for up to ${limit} transactions...`);
     
-    // Get transactions that don't have from addresses
     const transactionsToUpdate = statements.getTransactionsWithoutFromAddress.all(limit);
     
     if (transactionsToUpdate.length === 0) {
@@ -943,7 +928,6 @@ export async function backfillFromAddresses(limit = 100) {
     
     console.log(`📋 Found ${transactionsToUpdate.length} transactions to backfill`);
     
-    // Group transactions by block height for efficient processing
     const blockMap = new Map();
     for (const tx of transactionsToUpdate) {
       if (!blockMap.has(tx.block_height)) {
@@ -955,12 +939,10 @@ export async function backfillFromAddresses(limit = 100) {
     const uniqueBlockHeights = Array.from(blockMap.keys());
     console.log(`📦 Processing ${uniqueBlockHeights.length} unique blocks...`);
     
-    // Fetch all required blocks in parallel
     const blockResults = await getBlockDataBatch(uniqueBlockHeights);
     
     let updated = 0;
     
-    // Process each block's transactions
     for (const blockResult of blockResults) {
       if (!blockResult.data) continue;
       
@@ -978,7 +960,6 @@ export async function backfillFromAddresses(limit = 100) {
         if (targetTx) {
           let fromAddress = targetTx.from;
           
-          // Resolve if needed
           if (fromAddress && fromAddress.startsWith('prev:')) {
             const parts = fromAddress.replace('prev:', '').split(':');
             const prevTxId = parts[0];
@@ -987,7 +968,6 @@ export async function backfillFromAddresses(limit = 100) {
             fromAddress = await resolveFromAddress(prevTxId, voutIndex);
           }
           
-          // Update the transaction
           statements.updateTransactionFromAddress.run(
             fromAddress === 'Unknown' ? null : fromAddress,
             tx.tx_hash,
@@ -1009,7 +989,6 @@ export async function backfillFromAddresses(limit = 100) {
   }
 }
 
-// Legacy function for manual sync API
 export async function syncBlocks() {
   return await performSync();
 }
