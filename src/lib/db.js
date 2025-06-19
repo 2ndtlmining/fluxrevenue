@@ -246,7 +246,7 @@ const statements = {
     ORDER BY timestamp DESC LIMIT 1
   `),
 
-  // NEW: Cleanup old network stats (keep 1 year = 365 days * 2 snapshots = 730 records)
+  // 🔄 UPDATED: Cleanup old network stats (keep 4 years = 1460 days)
 deleteOldNetworkNodeStats: db.prepare(`
   DELETE FROM network_node_stats 
   WHERE timestamp < ?
@@ -256,13 +256,13 @@ deleteOldNetworkUtilizationStats: db.prepare(`
   WHERE timestamp < ?
 `),
 
-// Additional cleanup queries to maintain record limits
+// 🔄 UPDATED: Additional cleanup queries to maintain record limits (4 years * 365 days * 3 snapshots = 4380 records)
 deleteExcessNetworkNodeStats: db.prepare(`
   DELETE FROM network_node_stats 
   WHERE id NOT IN (
     SELECT id FROM network_node_stats 
     ORDER BY timestamp DESC 
-    LIMIT 730
+    LIMIT 4380
   ) AND timestamp < ?
 `),
 deleteExcessNetworkUtilizationStats: db.prepare(`
@@ -270,7 +270,7 @@ deleteExcessNetworkUtilizationStats: db.prepare(`
   WHERE id NOT IN (
     SELECT id FROM network_utilization_stats 
     ORDER BY timestamp DESC 
-    LIMIT 730
+    LIMIT 4380
   ) AND timestamp < ?
 `),
 
@@ -815,25 +815,25 @@ const dbUtils = {
     }
   },
 
-  // NEW: Cleanup old network statistics (keep 1 year)
+  // 🔄 UPDATED: Cleanup old network statistics (keep 4 years)
   cleanupOldNetworkStats() {
     try {
-      const oneYearAgo = Math.floor((Date.now() - (365 * 24 * 60 * 60 * 1000)) / 1000);
+      const fourYearsAgo = Math.floor((Date.now() - (1460 * 24 * 60 * 60 * 1000)) / 1000); // 🔄 CHANGED: 1460 days = 4 years
       
-      console.log('🧹 Cleaning up old network statistics...');
+      console.log('🧹 Cleaning up old network statistics (keeping 4 years)...');
       
-      // Delete old node stats (keep latest 730 records = 1 year of twice-daily snapshots)
-      const nodeStatsDeleted = statements.deleteOldNetworkNodeStats.run(oneYearAgo);
+      // Delete old node stats (keep latest 4380 records = 4 years of thrice-daily snapshots)
+      const nodeStatsDeleted = statements.deleteOldNetworkNodeStats.run(fourYearsAgo);
       
       // Delete old utilization stats
-      const utilizationStatsDeleted = statements.deleteOldNetworkUtilizationStats.run(oneYearAgo);
+      const utilizationStatsDeleted = statements.deleteOldNetworkUtilizationStats.run(fourYearsAgo);
       
       console.log(`✅ Cleanup completed: ${nodeStatsDeleted.changes} node stats, ${utilizationStatsDeleted.changes} utilization stats removed`);
       
       return {
         nodeStatsDeleted: nodeStatsDeleted.changes,
         utilizationStatsDeleted: utilizationStatsDeleted.changes,
-        cutoffDate: new Date(oneYearAgo * 1000).toISOString()
+        cutoffDate: new Date(fourYearsAgo * 1000).toISOString()
       };
     } catch (error) {
       console.error('❌ Error cleaning up old network stats:', error);
@@ -1183,13 +1183,13 @@ process.on('SIGINT', closeDatabase);
 process.on('SIGTERM', closeDatabase);
 process.on('exit', closeDatabase);
 
-// NEW: Enhanced periodic maintenance (every 30 minutes) + Network stats cleanup
+// 🔄 UPDATED: Enhanced periodic maintenance (every 30 minutes) + Network stats cleanup (4-year retention)
 if (DB_CONFIG.ENABLE_AUTO_MAINTENANCE !== false) {
   setInterval(async () => {
     try {
       await dbUtils.optimize();
       
-      // Cleanup old network stats once per day at 3 AM UTC
+      // Cleanup old network stats once per day at 3 AM UTC (4-year retention)
       const currentHour = new Date().getUTCHours();
       if (currentHour === 3) {
         await dbUtils.cleanupOldNetworkStats();
@@ -1200,14 +1200,14 @@ if (DB_CONFIG.ENABLE_AUTO_MAINTENANCE !== false) {
   }, 30 * 60 * 1000);
 }
 
-// NEW: Enhanced initialization logging
-console.log('🗄️ Database initialized with optimizations and network stats tracking');
+// 🔄 UPDATED: Enhanced initialization logging
+console.log('🗄️ Database initialized with optimizations and network stats tracking (4-year retention)');
 console.log(`   - WAL mode: ${DB_CONFIG.ENABLE_WAL_MODE !== false ? 'enabled' : 'disabled'}`);
 console.log(`   - Batch size: ${DB_CONFIG.BATCH_INSERT_SIZE || 200}`);
 console.log(`   - Optimized indexes: ${DB_CONFIG.OPTIMIZE_INDEXES !== false ? 'enabled' : 'disabled'}`);
 console.log(`   - Network stats tables: ✅ created`);
-console.log(`   - Twice-daily snapshots: ✅ configured`);
-console.log(`   - Auto cleanup: ✅ enabled (1 year retention)`);
+console.log(`   - Thrice-daily snapshots: ✅ configured`);
+console.log(`   - Auto cleanup: ✅ enabled (4 year retention)`);
 
 // SINGLE EXPORT STATEMENT - No duplicates
 export { db, statements, dbUtils };

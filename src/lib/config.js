@@ -11,7 +11,7 @@ export const TARGET_ADDRESSES = [
 // Sync configuration - SPEED OPTIMIZED BUT SAFE
 export const SYNC_CONFIG = {
   BLOCKS_PER_DAY: 720,
-  RETENTION_DAYS: 365,
+  RETENTION_DAYS: 1460,
   MAX_BLOCKS_PER_SYNC: 5000,         // 🚀 INCREASED FROM 1000 (5x improvement)
   SYNC_INTERVAL: 90 * 1000,          // 🚀 REDUCED TO 90 SECONDS (was 2 minutes)
   PARALLEL_BATCHES: 15,              // 🚀 INCREASED FROM 10 (50% more parallelism)
@@ -73,9 +73,9 @@ export const DB_CONFIG = {
   SYNC_SPEED_MODE: {
     synchronous: 'NORMAL',           // 🛡️ Keep NORMAL for safety (not OFF)
     journal_mode: 'WAL',             // 🛡️ Keep WAL mode (safer than MEMORY)
-    cache_size: 65536,               // 🚀 256MB cache (4x increase, reasonable)
+    cache_size: 131072,               // 🔄 INCREASED: 512MB cache (was 256MB) for larger DB
     temp_store: 'MEMORY',            // 🚀 Temp tables in memory (safe)
-    mmap_size: 536870912,            // 🚀 512MB memory-mapped I/O (2x increase)
+    mmap_size: 1073741824,            // 🔄 INCREASED: 1GB memory-mapped I/O (was 512MB)
     page_size: 4096,                 // 🛡️ Keep standard page size for compatibility
   },
   
@@ -86,7 +86,7 @@ export const DB_CONFIG = {
   
   // Safety settings
   BACKUP_BEFORE_OPTIMIZATION: true,  // 🛡️ Backup DB before speed optimizations
-  MAX_DB_SIZE_GB: 5,                 // 🛡️ Limit DB size to 5GB
+  MAX_DB_SIZE_GB: 55,                 // 🛡️ Limit DB size to 55GB
   ENABLE_INTEGRITY_CHECKS: true,     // 🛡️ Regular integrity checks
 };
 
@@ -113,14 +113,17 @@ export const REVENUE_CONFIG = {
     day: 720,      // 1 day = 720 blocks
     week: 5040,    // 7 days = 5040 blocks  
     month: 21600,  // 30 days = 21600 blocks
-    year: 262800   // 365 days = 262800 blocks
+    quarter: 64800,  // 🔄 NEW: 90 days = 64800 blocks
+    year: 262800,   // 365 days = 262800 blocks
+    fouryear: 1051200 // 🔄 NEW: 4 years = 1051200 blocks
+
   },
   ENABLE_REVENUE_CACHE: true,
   REVENUE_CACHE_DURATION: 10 * 1000,     // 🚀 REDUCED TO 10 SECONDS (was 15)
   
   // NEW: Revenue calculation optimizations
   ENABLE_BLOCK_RANGE_CACHE: true,        // 🚀 Cache block range queries
-  BLOCK_RANGE_CACHE_SIZE: 500,           // 🚀 Cache 500 block ranges (reasonable)
+  BLOCK_RANGE_CACHE_SIZE: 2000,           // 🚀 Cache 2000 block ranges (reasonable)
   PARALLEL_REVENUE_CALC: true,           // 🚀 Calculate all periods in parallel
 };
 
@@ -128,8 +131,8 @@ export const REVENUE_CONFIG = {
 export const NETWORK_STATS_CONFIG = {
   COLLECTION_FREQUENCY: 8 * 60 * 60 * 1000,  // 🚀 REDUCED TO 8 HOURS (was 12)
   COLLECTION_HOURS: [0, 8, 16],              // 🚀 3 TIMES DAILY (was 2)
-  RETENTION_DAYS: 365,
-  MAX_SNAPSHOTS: 1095,                       // 🚀 INCREASED (365 * 3 snapshots)
+  RETENTION_DAYS: 1460,
+  MAX_SNAPSHOTS: 4380,                       // 🚀 INCREASED (365 * 3 snapshots)
   API_TIMEOUT: 15000,                        // 🚀 REDUCED FROM 30s (faster timeout)
   MAX_RETRIES: 3,                            // Keep retries for reliability
   RETRY_DELAY: 3000,                         // 🚀 REDUCED FROM 5000ms
